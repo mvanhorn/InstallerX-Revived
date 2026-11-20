@@ -551,7 +551,6 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
             return null
         }
 
-        var resolvedLabel: CharSequence? = sessionInfo.appLabel
         var resolvedIcon: Bitmap? = reflect.getValue(sessionInfo, "appIcon")
         var path: String?
 
@@ -587,47 +586,16 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
         // ---------------------------------------------------------
         // Parse APK from path (if found)
         // ---------------------------------------------------------
-        if (!path.isNullOrEmpty() && runtime == PrivilegedRuntime.SystemApp) {
-            parsePackageArchive(path)?.let { archiveDetails ->
-                archiveDetails.getCharSequence("appLabel")?.let { resolvedLabel = it }
-                @Suppress("DEPRECATION")
-                (archiveDetails.getParcelable("appIcon") as? Bitmap)?.let { resolvedIcon = it }
-            }
-        }
-
-        val packageName = sessionInfo.appPackageName ?: ""
+        val archive = path?.takeIf { it.isNotEmpty() }?.let { parsePackageArchive(it) }
+        @Suppress("DEPRECATION")
+        (archive?.getParcelable("appIcon") as? Bitmap)?.let { resolvedIcon = it }
+        val packageName = resolveTargetPackage(sessionInfo.appPackageName, archive?.getString("packageName"))
 
         // Try to get the exact target User ID for this session, fallback to current process user
         val targetUserId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             sessionInfo.user.hashCode() // UserHandle.hashCode() == userId
         } else {
             reflect.getValue<Int>(sessionInfo, "userId") ?: (AndroidProcess.myUid() / 100000)
-        }
-
-        // ---------------------------------------------------------
-        // STRATEGY 3: Fallback to Installed App Info (Crucial for Updates)
-        // ---------------------------------------------------------
-        if ((resolvedLabel == null || resolvedIcon == null) && packageName.isNotEmpty()) {
-            runCatching {
-                // [Optimized] Use our hidden iPackageManager to respect the correct userId
-                val appInfo = getApplicationInfo(packageName, 0L, targetUserId) ?: return@runCatching
-                val pm = context.packageManager
-
-                if (resolvedLabel == null) resolvedLabel = appInfo.loadLabel(pm)
-                if (resolvedIcon == null) {
-                    val drawable = appInfo.loadIcon(pm)
-                    resolvedIcon = if (drawable is BitmapDrawable) {
-                        drawable.bitmap
-                    } else {
-                        val width = drawable.intrinsicWidth.takeIf { it > 0 } ?: 1
-                        val height = drawable.intrinsicHeight.takeIf { it > 0 } ?: 1
-                        drawable.toBitmap(width, height, Bitmap.Config.ARGB_8888)
-                    }
-                }
-                Timber.tag(TAG).d("Fallback: Loaded missing info from installed app")
-            }.onFailure { error ->
-                Timber.tag(TAG).w(error, "Failed to load installed app fallback for $packageName")
-            }
         }
 
         var isUpdate = false
@@ -641,7 +609,6 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
                 emptyArray(),
             ) == true
         }.getOrDefault(false)
-        var sourceAppLabel: CharSequence? = null
 
         if (packageName.isNotEmpty()) {
             // 1. Check if this is an update using iPackageManager and specific userId
@@ -679,26 +646,50 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
                     isOwnershipConflict = true
                 }
             }
+        }
 
-            // 3. Determine the appropriate source app label
+        val identity = resolveSessionIdentity(
+            packageName,
+            sessionInfo.appLabel,
+            archive?.getCharSequence("appLabel"),
+            sessionInfo.installerPackageName,
+            isOwnershipConflict,
+            updateOwnerPackageName,
+        )
+        var resolvedLabel = identity.label
+        val sourceAppLabel = identity.sourcePackageName?.let { source ->
             runCatching {
-                val targetPkgToResolve = if (isOwnershipConflict) {
-                    updateOwnerPackageName
-                } else {
-                    sessionInfo.installerPackageName
-                }
-
-                if (!targetPkgToResolve.isNullOrEmpty()) {
-                    val appInfo = getApplicationInfo(targetPkgToResolve, 0L, targetUserId)
-                    if (appInfo != null) {
-                        sourceAppLabel = appInfo.loadLabel(context.packageManager)
-                        Timber.tag(TAG).d("Source app label resolved: $sourceAppLabel (Conflict: $isOwnershipConflict)")
-                    } else {
-                        Timber.tag(TAG).w("Source app info is null for $targetPkgToResolve, user $targetUserId")
-                    }
-                }
+                val pm = context.packageManager
+                val info = getApplicationInfo(source, 0L, targetUserId) ?: pm.getApplicationInfo(source, 0)
+                info.loadLabel(pm)
             }.onFailure { error ->
                 Timber.tag(TAG).w(error, "Failed to resolve source app label for session $sessionId")
+            }.getOrNull()
+        }
+
+        // ---------------------------------------------------------
+        // STRATEGY 3: Fallback to Installed App Info (Crucial for Updates)
+        // ---------------------------------------------------------
+        if ((resolvedLabel == null || resolvedIcon == null) && packageName.isNotEmpty()) {
+            runCatching {
+                // [Optimized] Use our hidden iPackageManager to respect the correct userId
+                val appInfo = getApplicationInfo(packageName, 0L, targetUserId) ?: return@runCatching
+                val pm = context.packageManager
+
+                if (resolvedLabel == null) resolvedLabel = appInfo.loadLabel(pm)
+                if (resolvedIcon == null) {
+                    val drawable = appInfo.loadIcon(pm)
+                    resolvedIcon = if (drawable is BitmapDrawable) {
+                        drawable.bitmap
+                    } else {
+                        val width = drawable.intrinsicWidth.takeIf { it > 0 } ?: 1
+                        val height = drawable.intrinsicHeight.takeIf { it > 0 } ?: 1
+                        drawable.toBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    }
+                }
+                Timber.tag(TAG).d("Fallback: Loaded missing info from installed app")
+            }.onFailure { error ->
+                Timber.tag(TAG).w(error, "Failed to load installed app fallback for $packageName")
             }
         }
 
@@ -709,7 +700,7 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
 
         return Bundle().apply {
             resolvedLabel?.let { putCharSequence("appLabel", it) }
-            putString("packageName", packageName)
+            putString("packageName", identity.packageName)
             putString("installerPackageName", sessionInfo.installerPackageName)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) putInt("installerUid", sessionInfo.installerUid)
             path?.let { putString("resolvedBaseCodePath", it) }
@@ -993,3 +984,20 @@ class DefaultPrivilegedService private constructor(private val runtime: Privileg
         return output
     }
 }
+
+internal data class SessionIdentity(val packageName: String, val label: CharSequence?, val sourcePackageName: String?)
+
+internal fun resolveTargetPackage(sessionPackage: String?, archivePackage: String?): String = sessionPackage?.takeIf { it.isNotBlank() } ?: archivePackage?.takeIf { it.isNotBlank() }.orEmpty()
+
+internal fun resolveSessionIdentity(
+    packageName: String,
+    sessionLabel: CharSequence?,
+    archiveLabel: CharSequence?,
+    installerPackageName: String?,
+    ownershipConflict: Boolean,
+    updateOwnerPackageName: String?,
+): SessionIdentity = SessionIdentity(
+    packageName,
+    sessionLabel?.takeIf { it.isNotBlank() } ?: archiveLabel?.takeIf { it.isNotBlank() },
+    (if (ownershipConflict) updateOwnerPackageName else installerPackageName)?.takeIf { it.isNotBlank() },
+)

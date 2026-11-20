@@ -48,12 +48,14 @@ class ApproveSessionUseCase(
         granted: Boolean,
         result: Result<Unit>,
     ) {
+        if (result.isSuccess && !granted) return
+
         val packageName = details?.packageName?.takeIf { it.isNotBlank() } ?: "unknown"
         runCatching {
             recordOperationHistory(
                 OperationHistoryModel(
                     operationType = OperationType.SESSION_CONFIRM,
-                    status = if (result.isSuccess && granted) OperationStatus.SUCCESS else OperationStatus.FAILED,
+                    status = if (result.isSuccess) OperationStatus.SUCCESS else OperationStatus.FAILED,
                     packageName = packageName,
                     appLabel = details?.appLabel?.toString(),
                     isFreshInstall = details?.isUpdate?.let { !it },
@@ -63,16 +65,8 @@ class ApproveSessionUseCase(
                     installMethod = InstallMethod.SESSION,
                     authorizer = config.authorizer,
                     installMode = config.installMode,
-                    errorSummary = when {
-                        result.isFailure -> result.exceptionOrNull()?.historyErrorSummary()
-                        !granted -> "Session confirmation denied"
-                        else -> null
-                    },
-                    errorType = when {
-                        result.isFailure -> result.exceptionOrNull()?.historyErrorType()
-                        !granted -> "DENIED"
-                        else -> null
-                    },
+                    errorSummary = result.exceptionOrNull()?.historyErrorSummary(),
+                    errorType = result.exceptionOrNull()?.historyErrorType(),
                 ),
             )
         }.onFailure { e ->
